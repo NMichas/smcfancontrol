@@ -1,0 +1,46 @@
+#!/bin/bash
+############################################
+#                                          #
+#  Name: install                           #
+#  Version: 0.2                            #
+#  Description:                            #
+#     Installs rc-scripts on Ubuntu        #
+#  Dependencies:                           #
+#     update-rc.d                          #
+#  Author: Kenny Lasse Hoff Levinsen       #
+#     Alias: Joushou                       #
+#  Use at own risk                         #
+#                                          #
+############################################
+
+script="smcfancontrol"
+initscript="smcfancontrol.sh"
+scriptrlevel=20
+rcupdate="update-rc.d"
+
+fatal() # Fatal error
+{
+	echo "FATAL: $1" > /dev/stderr
+	echo "Commiting suicide. Bye."
+	exit 1
+}
+
+[[ $(whoami) != "root" ]] && fatal "User not root"
+[ -e $script ] || fatal "$script is missing"
+[ -e $initscript ] || fatal "$initscript is missing"
+
+
+
+echo "Copying files over"
+cp $initscript /etc/init.d/$initscript || fatal "Copying $initscript"
+cp $script /usr/local/sbin/$script || fatal "Copying $script"
+
+echo "Installing init-script"
+cd /etc/init.d/
+update-rc.d $initscript defaults $scriptrlevel || fatal "Failed to install rc-scripts"
+
+echo "Running $initscript"
+/etc/init.d/$initscript start || fatal "Failed to call $initscript"
+echo "Installation complete"
+
+exit 0
