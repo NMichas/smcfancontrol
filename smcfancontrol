@@ -1,0 +1,213 @@
+#!/bin/bash
+############################################
+#                                          #
+#  Name: fanControl                        #
+#  Version: 0.2                            #
+#  Description:                            #
+#     Control fans on Apple Macintosh      #
+#  Dependencies:                           #
+#     applesmc                             #
+#  Author: Kenny Lasse Hoff Levinsen       #
+#     Alias: Joushou                       #
+#  Use at own risk                         #
+#                                          #
+############################################
+
+platformPath=/sys/devices/platform
+appleSMCPath=$platformPath/applesmc.768
+			# Path to applesmc (Seems static)
+
+minTemp=60		# Lowest temperature
+maxOnlineTemp=100	# Highest temperature when online
+maxOfflineTemp=100	# Highest temperature when offline
+
+fanMinSpeed=1500	# Lowest fan-speed
+fanMaxSpeed=5500	# Highest fan-speed
+
+tempCalc=average	# Temperature calculation ("highest" uses highest temperature, "average" takes the average
+sensorsUsed=2		# How many sensors to use (first sensors are for coretemp, one for each CPU core)
+debug=onChange		# Set to onLoop for every loop, onChange on state-changes, or false for off
+manFanControl=true	# Set to true if you want to define direct output, instead of fan minimum speeds
+useCoretemp=true	# Set to false if you don't want to use coretemp sensors
+checkInterval=1		# Interval to check whether fan speed needs an update (in seconds)
+updateInterval=0.5	# Interval to update fan speed (in seconds). Set to $checkInterval for immediate updates and to small values to change fan speed gradually.
+debugTo=/var/log/smcfancontrol.log
+			# Where to write our debugging to (/dev/stdout for standard output)
+
+debug() # Prints text with a timestamp, when $debug
+{
+	[[ $debug == onChange ]] && [[ $stateChange == true ]] && echo "$(date "+%d/%m %H:%M:%S"): $@" >> $debugTo
+	[[ $debug == onLoop ]] && echo "$(date "+%d/%m %H:%M:%S"): $@" >> $debugTo
+}
+
+fatal() # Fatal error
+{
+	stateChange=true
+	debug "FATAL: Failing at: $1"
+	echo "$(date "+%d/%m %H:%M:%S"): FATAL: Failing at: $1" > /dev/stderr
+	debug "Attempting to set fans to safe values"
+	for i in $appleSMCPath/fan*_manual
+	do
+		echo 0 > $i
+	done
+	fanEnd="_min"
+	counter=0
+	until [[ $counter == $fans ]]
+	do
+		((counter++))
+		echo 4000 > $appleSMCPath/fan${counter}${fanEnd}
+	done
+	debug "Committing suicide. Bye."
+	exit 1
+}
+
+initSetup() # Initialize
+{
+	[[ $debugTo != "/dev/stdout" ]] && [ -e $debugTo ] && mv ${debugTo} ${debugTo}.0
+	fans=0
+	debug "Detecting configuration"
+	for i in $appleSMCPath/fan*_output # Count fans
+	do
+		((fans++))
+	done
+
+	if [[ $manFanControl == true ]]
+	then
+		for i in $appleSMCPath/fan*_manual
+		do
+			echo 1 > $i
+		done
+		fanEnd="_output"
+	else
+		for i in $appleSMCPath/fan*_manual
+		do
+			echo 0 > $i
+		done
+		fanEnd="_min"
+	fi
+
+	debug "  Fans: $fans $([[ $manFanControl == true ]] && echo ', Manually controlled')"
+	debug "    Min fan-speed: $fanMinSpeed"
+	debug "    Max fan-speed: $fanMaxSpeed"
+
+	coretempSensors=0
+	if [ $useCoretemp == true -a -d $platformPath/coretemp.0 ]; then
+		for i in $platformPath/coretemp.0/temp*_label # Count coretemp sensors
+		do
+			((coretempSensors++))
+		done
+	fi
+	sensors=$coretempSensors
+	for i in $appleSMCPath/temp*_input # Count appleSMC temperature sensors
+	do
+		((sensors++))
+	done
+
+	debug "  Sensors: $sensors"
+	debug "    Limited by user to $sensorsUsed"
+
+	laptop=false
+	online=false
+	#(cat /proc/acpi/battery/BAT0/state | grep "yes" > /dev/null) && laptop=true || online=true
+	#(cat /proc/acpi/ac_adapter/ADP1/state | grep on-line > /dev/null) && online=true || online=false
+
+	debug "  Laptop: $laptop"
+	debug "    ACPI-State: $([[ $online == true ]] && echo online || echo offline)"
+	debug "Configuration detected"
+
+	((ratio=(fanMaxSpeed-fanMinSpeed)/(maxOnlineTemp-minTemp)))
+	updateSteps=$(echo "$checkInterval/$updateInterval" | bc)
+	lastSpeed=$(cat $appleSMCPath/fan1${fanEnd})
+}
+
+setFans() # Adjust fan-speeds
+{
+	counter=0
+	until [[ $counter == $fans ]]
+	do
+		((counter++))
+		echo $1 > $appleSMCPath/fan${counter}${fanEnd} || fatal "setting fans"
+	done
+}
+
+update() # Update temperatures and ACPI state
+{
+	counter=1
+	while ((counter <= sensorsUsed))
+	do
+		if (($counter <= $coretempSensors)); then # first sensors are for coretemp
+			tempVar=$(cat $platformPath/coretemp.0/temp$((counter+1))_input) # || fatal
+		else
+			tempVar=$(cat $appleSMCPath/temp$((counter-coretempSensors))_input) # || fatal
+		fi
+		((tempSensor[$counter]=tempVar/1000))
+		((counter++))
+	done
+
+	if [[ $tempCalc == "highest" ]]
+	then
+		counter=0
+		temp=0
+		until [[ $counter == $sensorsUsed ]] || [[ $counter == $sensors ]]
+		do
+			((counter++))
+			[[ ${tempSensor[$counter]} > $temp ]] && temp=${tempSensor[$counter]}
+		done
+		[[ $oldTemp != $temp ]] && stateChange=true && oldTemp=$temp
+	else
+		counter=0
+		temp=0
+		until [[ $counter == $sensorsUsed ]] || [[ $counter == $sensors ]]
+		do
+			((counter++))
+			let "temp = ${tempSensor[$counter]} + $temp"
+		done
+		((temp=temp/(counter)))
+		[[ $oldTemp != $temp ]] && stateChange=true && oldTemp=$temp
+	fi
+
+	if [[ $laptop == true ]]
+	then
+		(cat /proc/acpi/ac_adapter/ADP1/state | grep on-line > /dev/null) && online=true || online=false
+
+		if [[ $oldOnline != $online ]]
+		then
+			[[ $online == true ]] && maxTemp=$maxOnlineTemp || maxTemp=$maxOfflineTemp
+			((ratio=(fanMaxSpeed-fanMinSpeed)/(maxTemp-minTemp)))
+			oldOnline=$online
+			stateChange=true
+		fi
+	fi
+}
+
+stateChange=true
+initSetup
+
+while : # Lets loop
+do
+	update || fatal "calling update"
+	if [[ $stateChange == true ]]
+	then
+		if [ $speed ]; then
+			lastSpeed=$speed
+		fi
+		((speed=((temp-minTemp)*ratio)+fanMinSpeed))
+		(( $speed >= $fanMaxSpeed )) && speed=$fanMaxSpeed				# Don't try to set fan-speed over $fanMaxSpeed
+		(( $speed <= $fanMinSpeed )) && speed=$fanMinSpeed				# Don't try to set fan-speed under $fanMinSpeed
+	fi
+	debug "Temperature: $temp, Fan-speed: $speed, ACPI-State: $([[ $online == true ]] && echo online || echo offline)"
+	if [[ $stateChange == true ]]
+	then
+		# Gradually set fan speed
+		updateCounter=1
+		while ((updateCounter <= updateSteps)); do
+			((actualSpeed=lastSpeed+(speed-lastSpeed)*updateCounter/updateSteps))
+			setFans $actualSpeed || fatal "calling setFans"
+			sleep $updateInterval
+			((updateCounter++))
+		done
+		stateChange=false
+	else
+		sleep $checkInterval
+	fi
+done
